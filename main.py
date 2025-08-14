@@ -4,7 +4,7 @@ from pymongo.mongo_client import MongoClient
 import discord
 from discord.ext import commands, tasks
 from discord.ui import Button, View
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 import re
 import webserver
 
@@ -64,7 +64,7 @@ async def play(interaction: discord.Interaction):
     quote = quotes_collection.aggregate([{"$sample": {"size": 1}}]).next()
     if history.count_documents({}) >= 100:
         move_quotes_back()
-    quote["moved_to_history_at"] = datetime.now()
+    quote["moved_to_history_at"] = datetime.now(timezone.utc)
     history.insert_one(quote)
     quotes_collection.delete_one({"_id": quote["_id"]})
 
@@ -104,5 +104,5 @@ async def guess(interaction: discord.Interaction, author: discord.Member = None)
 
 # Start the bot
 TOKEN = os.getenv('DISCORD_TOKEN')
-webserver.keep_alive()
+# webserver.keep_alive()
 client.run(TOKEN)
