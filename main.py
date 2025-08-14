@@ -6,6 +6,7 @@ from discord.ext import commands, tasks
 from discord.ui import Button, View
 from datetime import datetime, timedelta
 import re
+import webserver
 
 GAME_ACTIVE = False
 
@@ -101,4 +102,5 @@ async def guess(interaction: discord.Interaction, author: discord.Member = None)
 
 # Start the bot
 TOKEN = os.getenv('DISCORD_TOKEN')
+webserver.keep_alive()
 client.run(TOKEN)
