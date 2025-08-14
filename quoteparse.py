@@ -1,4 +1,12 @@
 import re
+import json
+from dotenv import load_dotenv
+import os
+from pymongo.mongo_client import MongoClient
+
+# I need to add a filter of the stuff that has ":" because its a link (https://)
+# Dashes should really only be taken after quotation marks (otherwise stuff like tear-jerking is counted)
+# Need to do something about mike the hacker
 
 def parse_quote(quote_data):
     content = quote_data["content"]
@@ -32,3 +40,17 @@ def parse_quote(quote_data):
         "quote": processed,
         "name": names
     }
+
+with open("quotes.json", "r", encoding="utf-8") as f:
+   data = json.load(f)
+
+load_dotenv()
+MONGO_URI = os.getenv('uri')
+mclient = MongoClient(MONGO_URI)
+db = mclient["quote-game"]
+quote_collection = db.quotes
+
+for item in data:
+    result = parse_quote(item)
+    if result:
+        quote_collection.insert_one(result)
