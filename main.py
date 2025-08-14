@@ -47,6 +47,8 @@ client = Client(command_prefix='!', intents=intents)
 # Move all quotes from history back to quotes
 def move_quotes_back():
     for quote in history.find():
+        quote.pop('_id', None)  # Remove the _id field
+        quote.pop('moved_to_history_at', None)  # Also remove the timestamp field
         quotes_collection.insert_one(quote)
     history.delete_many({})
 
