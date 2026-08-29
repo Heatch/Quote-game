@@ -5,10 +5,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import Button, View
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone, timedelta
+from zoneinfo import ZoneInfo
 import re
 import asyncio
 import webserver
+
+from quote_ingester import check_new_quotes
 
 # Getting environment variables
 load_dotenv()
@@ -53,6 +56,32 @@ class Client(commands.Bot):
         except Exception as e:
             print(f"Failed to sync commands: {e}")
 
+        # Catch up on missed quote checks
+        try:
+            last_check = db.metadata.find_one({"key": "last_quote_check"})
+            should_catch_up = False
+            if last_check and last_check.get("timestamp"):
+                last_time = datetime.fromisoformat(last_check["timestamp"])
+                if last_time.tzinfo is None:
+                    last_time = last_time.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - last_time).total_seconds() > 86400:
+                    should_catch_up = True
+            else:
+                should_catch_up = True
+
+            if should_catch_up:
+                print("Catching up on missed quote check...")
+                await check_new_quotes(self)
+        except Exception as e:
+            print(f"Failed to catch up on quote check: {e}")
+
+        # Start daily quote ingestion loop
+        try:
+            daily_quote_ingest.start(self)
+            print("Started daily quote ingestion loop.")
+        except Exception as e:
+            print(f"Failed to start daily quote ingestion loop: {e}")
+
 # Intent setup
 intents = discord.Intents.default()
 intents.message_content = True
@@ -83,6 +112,17 @@ async def game_timeout(message_id: int, delay: int = 60):
         )
     except asyncio.CancelledError:
         pass
+
+
+@tasks.loop(time=time(hour=6, tzinfo=ZoneInfo("America/New_York")))
+async def daily_quote_ingest(bot_client):
+    print("Running daily quote ingestion...")
+    try:
+        await check_new_quotes(bot_client)
+    except Exception as e:
+        print(f"Daily quote ingestion failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def get_display_name(member_entry):
@@ -324,10 +364,27 @@ async def pref(interaction: discord.Interaction, user: discord.Member, name: str
     )
 
 
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+@client.tree.command(name="refresh_quotes", description="Manually check for new quotes in the quotes channel", guild=GUILD_ID)
+async def refresh_quotes(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        count = await check_new_quotes(client)
+        await interaction.followup.send(
+            f"Quote check complete. {count} new quotes added.", ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"Quote check failed: {e}", ephemeral=True
+        )
+
+
 @onboard.error
 @nicks.error
 @add.error
 @pref.error
+@refresh_quotes.error
 async def admin_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.errors.MissingPermissions):
         if interaction.response.is_done():

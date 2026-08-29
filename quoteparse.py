@@ -130,34 +130,39 @@ def parse_quote_message(message, name_map):
     }
 
 
-with open("quotes.json", "r", encoding="utf-8") as f:
-    data = json.load(f)
+def main():
+    with open("quotes.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-load_dotenv()
-MONGO_URI = os.getenv('uri')
-mclient = MongoClient(MONGO_URI)
-db = mclient["quote-game"]
-quote_collection = db.quotes
-members_collection = db.members
-history_collection = db.history
+    load_dotenv()
+    MONGO_URI = os.getenv('uri')
+    mclient = MongoClient(MONGO_URI)
+    db = mclient["quote-game"]
+    quote_collection = db.quotes
+    members_collection = db.members
+    history_collection = db.history
 
-# Load members and build name map
-members = list(members_collection.find())
-name_map = build_name_to_members(members)
+    # Load members and build name map
+    members = list(members_collection.find())
+    name_map = build_name_to_members(members)
 
-# Reset quotes and history (old format incompatible)
-quote_collection.delete_many({})
-history_collection.delete_many({})
+    # Reset quotes and history (old format incompatible)
+    quote_collection.delete_many({})
+    history_collection.delete_many({})
 
-parsed_count = 0
-skipped_count = 0
+    parsed_count = 0
+    skipped_count = 0
 
-for item in data:
-    result = parse_quote_message(item, name_map)
-    if result:
-        quote_collection.insert_one(result)
-        parsed_count += 1
-    else:
-        skipped_count += 1
+    for item in data:
+        result = parse_quote_message(item, name_map)
+        if result:
+            quote_collection.insert_one(result)
+            parsed_count += 1
+        else:
+            skipped_count += 1
 
-print(f"Parsed {parsed_count} quotes. Skipped {skipped_count} messages.")
+    print(f"Parsed {parsed_count} quotes. Skipped {skipped_count} messages.")
+
+
+if __name__ == "__main__":
+    main()
