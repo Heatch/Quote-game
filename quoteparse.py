@@ -4,53 +4,160 @@ from dotenv import load_dotenv
 import os
 from pymongo.mongo_client import MongoClient
 
-# I need to add a filter of the stuff that has ":" because its a link (https://)
-# Dashes should really only be taken after quotation marks (otherwise stuff like tear-jerking is counted)
-# Need to do something about mike the hacker
 
-def parse_quote(quote_data):
-    content = quote_data["content"]
-    quoter = quote_data["author"]["display_name"]
+def build_name_to_members(members):
+    """Build mapping from lowercase name to list of member docs."""
+    name_map = {}
+    for member in members:
+        if "id" not in member:
+            print(f"Warning: member document missing 'id' field: {member}")
+            continue
+        names = [
+            member.get("name", ""),
+            member.get("display_name", ""),
+            member.get("preferred_name", ""),
+        ]
+        names.extend(member.get("nicks", []))
+        for name in names:
+            if name:
+                name_lower = name.lower()
+                if name_lower not in name_map:
+                    name_map[name_lower] = []
+                if member not in name_map[name_lower]:
+                    name_map[name_lower].append(member)
+    return name_map
 
-    names = []
-    processed = content
 
-    # Replace and collect dialogue style names: Name: text
-    def repl_dialogue(m):
-        name = m.group(1).strip()
-        actual = quoter if name.lower() == "me" else name.lower()
-        names.append(actual)
-        return f"###:{m.group(2)}"
-    processed = re.sub(r'(?m)^([^\s:]+):\s*(.*)', repl_dialogue, processed)
+def has_quotes(text):
+    """Return True if text has 2+ single quotes or 2+ double quotes."""
+    return text.count('"') >= 2 or text.count("'") >= 2
 
-    # Replace and collect hyphen style names: "quote" - name OR unquoted - name
-    # This regex finds all instances of -name (with optional spaces)
-    def repl_hyphen(m):
-        name = m.group(1).strip()
-        actual = quoter if name.lower() == "me" else name.lower()
-        names.append(actual)
-        return " - ###"
-    processed = re.sub(r'-\s*([^\s,]+)', repl_hyphen, processed)
 
-    if not names:
+def extract_outside_quotes(text):
+    """Return text with double-quoted and single-quoted sections removed."""
+    outside = re.sub(r'"[^"]*"', '', text)
+    outside = re.sub(r"'[^']*'", '', outside)
+    return outside
+
+
+def find_name_matches(text, name_map):
+    """
+    Find all member name matches in text.
+    Returns (matches, ambiguous) where matches is a list of dicts with
+    member, name, and position; ambiguous is True if any matched name
+    resolves to multiple members.
+    """
+    matches = {}
+    ambiguous = False
+
+    # Sort names longest first to handle overlapping names (e.g., "Michael Smith" before "Michael")
+    sorted_names = sorted(name_map.keys(), key=len, reverse=True)
+
+    for name in sorted_names:
+        members_for_name = name_map[name]
+        pattern = r'\b' + re.escape(name) + r'\b'
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            if len(members_for_name) > 1:
+                ambiguous = True
+                break
+            member = members_for_name[0]
+            member_id = member["id"]
+            position = match.start()
+            if member_id not in matches or position < matches[member_id]["position"]:
+                matches[member_id] = {
+                    "member": member,
+                    "name": name,
+                    "position": position,
+                }
+        if ambiguous:
+            break
+
+    sorted_matches = sorted(matches.values(), key=lambda x: x["position"])
+    return sorted_matches, ambiguous
+
+
+def redact_names(text, members):
+    """Replace all names for the given members with []."""
+    redacted = text
+    for member in members:
+        names = [
+            member.get("name", ""),
+            member.get("display_name", ""),
+            member.get("preferred_name", ""),
+        ]
+        names.extend(member.get("nicks", []))
+        for name in names:
+            if name:
+                pattern = r'\b' + re.escape(name) + r'\b'
+                redacted = re.sub(pattern, '[]', redacted, flags=re.IGNORECASE)
+    return redacted
+
+
+def parse_quote_message(message, name_map):
+    """Parse a dumped Discord message into the new quote schema."""
+    content = message.get("content", "")
+
+    if not has_quotes(content):
         return None
 
+    outside_text = extract_outside_quotes(content)
+    if not outside_text.strip():
+        return None
+
+    matches, ambiguous = find_name_matches(outside_text, name_map)
+
+    if ambiguous or not matches:
+        return None
+
+    members = [m["member"] for m in matches]
+    redacted_quote = redact_names(content, members)
+
     return {
-        "quoter": quoter,
-        "quote": processed,
-        "name": names
+        "quoter_id": message["author"]["id"],
+        "original_quote": content,
+        "redacted_quote": redacted_quote,
+        "members_mentioned": [
+            {
+                "id": m["id"],
+                "name": m.get("name"),
+                "display_name": m.get("display_name"),
+                "preferred_name": m.get("preferred_name"),
+                "nicks": m.get("nicks", []),
+            }
+            for m in members
+        ],
+        "timestamp": message.get("timestamp"),
     }
 
+
 with open("quotes.json", "r", encoding="utf-8") as f:
-   data = json.load(f)
+    data = json.load(f)
 
 load_dotenv()
 MONGO_URI = os.getenv('uri')
 mclient = MongoClient(MONGO_URI)
 db = mclient["quote-game"]
 quote_collection = db.quotes
+members_collection = db.members
+history_collection = db.history
+
+# Load members and build name map
+members = list(members_collection.find())
+name_map = build_name_to_members(members)
+
+# Reset quotes and history (old format incompatible)
+quote_collection.delete_many({})
+history_collection.delete_many({})
+
+parsed_count = 0
+skipped_count = 0
 
 for item in data:
-    result = parse_quote(item)
+    result = parse_quote_message(item, name_map)
     if result:
         quote_collection.insert_one(result)
+        parsed_count += 1
+    else:
+        skipped_count += 1
+
+print(f"Parsed {parsed_count} quotes. Skipped {skipped_count} messages.")
