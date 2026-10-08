@@ -3,3 +3,7 @@
 test.py
 __pycache__
 .opencode
+*.db
+*.db-wal
+*.db-shm
+DOCKERIZE.md

@@ -1,8 +1,8 @@
 import re
 import json
 from dotenv import load_dotenv
-import os
-from pymongo.mongo_client import MongoClient
+
+import database
 
 
 def build_name_to_members(members):
@@ -127,41 +127,42 @@ def parse_quote_message(message, name_map):
             for m in members
         ],
         "timestamp": message.get("timestamp"),
+        "source_message_id": message.get("id"),
     }
 
 
 def main():
+    load_dotenv()
+    database.connect()
+
     with open("quotes.json", "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    load_dotenv()
-    MONGO_URI = os.getenv('uri')
-    mclient = MongoClient(MONGO_URI)
-    db = mclient["quote-game"]
-    quote_collection = db.quotes
-    members_collection = db.members
-    history_collection = db.history
-
     # Load members and build name map
-    members = list(members_collection.find())
+    members = database.all_members_with_nicks()
     name_map = build_name_to_members(members)
 
-    # Reset quotes and history (old format incompatible)
-    quote_collection.delete_many({})
-    history_collection.delete_many({})
+    # Reset quotes (old format incompatible); quote_mentions cascade away
+    conn = database.get_conn()
+    with conn:
+        conn.execute("DELETE FROM quotes")
 
     parsed_count = 0
     skipped_count = 0
+    duplicate_count = 0
 
     for item in data:
         result = parse_quote_message(item, name_map)
-        if result:
-            quote_collection.insert_one(result)
-            parsed_count += 1
-        else:
+        if result is None:
             skipped_count += 1
+        elif database.insert_quote(result) is None:
+            duplicate_count += 1
+        else:
+            parsed_count += 1
 
     print(f"Parsed {parsed_count} quotes. Skipped {skipped_count} messages.")
+    if duplicate_count:
+        print(f"Skipped {duplicate_count} duplicates (same quoter_id + timestamp).")
 
 
 if __name__ == "__main__":

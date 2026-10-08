@@ -1,21 +1,14 @@
 import os
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from pymongo.mongo_client import MongoClient
 import discord
 import asyncio
 
+import database
 from quoteparse import build_name_to_members, parse_quote_message
 
 load_dotenv()
-MONGO_URI = os.getenv('uri')
 QUOTES_CHANNEL_ID = os.getenv('QUOTES_CHANNEL_ID')
-
-mclient = MongoClient(MONGO_URI)
-db = mclient["quote-game"]
-quotes_collection = db.quotes
-members_collection = db.members
-metadata_collection = db.metadata
 
 
 METADATA_KEY = "last_quote_check"
@@ -32,33 +25,30 @@ def _parse_timestamp(ts):
 
 def _get_last_check_time():
     """Return the datetime after which we should fetch messages."""
-    doc = metadata_collection.find_one({"key": METADATA_KEY})
-    if doc and doc.get("timestamp"):
-        return _parse_timestamp(doc["timestamp"])
+    timestamp = database.get_metadata(METADATA_KEY)
+    if timestamp:
+        return _parse_timestamp(timestamp)
 
     # No previous check. Use the most recent quote timestamp, or 24 hours ago.
-    most_recent = quotes_collection.find_one(sort=[("timestamp", -1)])
-    if most_recent and most_recent.get("timestamp"):
-        return _parse_timestamp(most_recent["timestamp"])
+    most_recent = database.latest_quote_timestamp()
+    if most_recent:
+        return _parse_timestamp(most_recent)
 
     return datetime.now(timezone.utc) - timedelta(hours=24)
 
 
 def _update_last_check_time(timestamp):
     """Store the last check timestamp in metadata."""
-    metadata_collection.update_one(
-        {"key": METADATA_KEY},
-        {"$set": {"timestamp": timestamp.isoformat()}},
-        upsert=True,
-    )
+    database.set_metadata(METADATA_KEY, timestamp.isoformat())
 
 
 def _is_duplicate(quote):
-    """Check if this quote already exists by quoter_id + timestamp."""
-    return quotes_collection.find_one({
-        "quoter_id": quote["quoter_id"],
-        "timestamp": quote["timestamp"],
-    }) is not None
+    """Check if this quote already exists by message id or quoter_id + timestamp."""
+    return database.quote_exists(
+        quote["quoter_id"],
+        quote["timestamp"],
+        quote.get("source_message_id"),
+    )
 
 
 async def check_new_quotes(bot_client):
@@ -86,19 +76,26 @@ async def check_new_quotes(bot_client):
         return 0
 
     # Load members and build name map
-    members = list(members_collection.find())
+    members = database.all_members_with_nicks()
     name_map = build_name_to_members(members)
 
     after_time = _get_last_check_time()
     newest_time = after_time
     added_count = 0
     checked_count = 0
+    scan_failed = False
 
     print(f"Checking for new quotes after {after_time.isoformat()}")
 
     try:
         async for message in channel.history(limit=None, after=after_time, oldest_first=True):
             checked_count += 1
+
+            # Everything up to this message has now been examined, whether or
+            # not it becomes a quote. Advance the watermark before any skip so
+            # duplicates and unparseable messages are never scanned twice.
+            if message.created_at > newest_time:
+                newest_time = message.created_at
 
             # Skip messages with attachments
             if message.attachments:
@@ -123,25 +120,31 @@ async def check_new_quotes(bot_client):
             if _is_duplicate(quote):
                 continue
 
-            quotes_collection.insert_one(quote)
-            added_count += 1
-
-            if message.created_at > newest_time:
-                newest_time = message.created_at
+            if database.insert_quote(quote) is not None:
+                added_count += 1
 
             # Small delay to be nice to the API
             if checked_count % 100 == 0:
                 await asyncio.sleep(1)
 
     except discord.errors.DiscordServerError as e:
+        scan_failed = True
         print(f"Discord server error while checking quotes: {e}")
     except Exception as e:
+        scan_failed = True
         print(f"Error checking quotes: {e}")
         import traceback
         traceback.print_exc()
 
-    # Update last check time to the newest processed message time, or now if nothing processed
-    final_time = newest_time if newest_time > after_time else datetime.now(timezone.utc)
+    # Resume point = the newest message actually examined. If the scan failed
+    # before examining anything, keep the old watermark so the window is
+    # retried instead of silently skipped.
+    if newest_time > after_time:
+        final_time = newest_time
+    elif scan_failed:
+        final_time = after_time
+    else:
+        final_time = datetime.now(timezone.utc)
     _update_last_check_time(final_time)
 
     print(f"Checked {checked_count} messages. Added {added_count} new quotes.")

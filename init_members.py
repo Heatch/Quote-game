@@ -1,17 +1,15 @@
 from dotenv import load_dotenv
 import os
-from pymongo.mongo_client import MongoClient
 import discord
 import asyncio
+
+import database
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 SERVER_ID = int(os.getenv('COVID_ID'))  # Your guild/server ID as int
 
-MONGO_URI = os.getenv('uri')
-mclient = MongoClient(MONGO_URI)
-db = mclient["quote-game"]
-members_collection = db.members
+database.connect()
 
 intents = discord.Intents.default()
 intents.members = True  # Important to fetch members
@@ -47,10 +45,11 @@ async def on_ready():
         members_data.append(member_doc)
 
     if members_data:
-        # Optional: Clear existing members collection before inserting new data
-        members_collection.delete_many({})
-        result = members_collection.insert_many(members_data)
-        print(f"Inserted {len(result.inserted_ids)} members into the database.")
+        # Upsert members. preferred_name and nicks are preserved: they cannot be
+        # derived from Discord and would otherwise be lost.
+        for member_doc in members_data:
+            database.upsert_member(member_doc)
+        print(f"Upserted {len(members_data)} members into the database.")
     else:
         print("No members found to insert.")
 

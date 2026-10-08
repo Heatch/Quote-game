@@ -1,6 +1,5 @@
 from dotenv import load_dotenv
 import os
-from pymongo.mongo_client import MongoClient
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -9,22 +8,17 @@ from datetime import datetime, time, timezone, timedelta
 from zoneinfo import ZoneInfo
 import re
 import asyncio
-import webserver
 
+import database
 from quote_ingester import check_new_quotes
 
 # Getting environment variables
 load_dotenv()
 SERVER_ID = os.getenv('COVID_ID')
 GUILD_ID = discord.Object(id=int(SERVER_ID))
-MONGO_URI = os.getenv('uri')
 
-# Create a new client and connect to the server
-mclient = MongoClient(MONGO_URI)
-db = mclient["quote-game"]
-members_collection = db.members
-quotes_collection = db.quotes
-history = db.history
+# Create (or open) the SQLite database and apply the schema
+database.connect()
 
 # Active games keyed by bot message ID
 active_games = {}
@@ -58,10 +52,10 @@ class Client(commands.Bot):
 
         # Catch up on missed quote checks
         try:
-            last_check = db.metadata.find_one({"key": "last_quote_check"})
+            last_check = database.get_metadata("last_quote_check")
             should_catch_up = False
-            if last_check and last_check.get("timestamp"):
-                last_time = datetime.fromisoformat(last_check["timestamp"])
+            if last_check:
+                last_time = datetime.fromisoformat(last_check)
                 if last_time.tzinfo is None:
                     last_time = last_time.replace(tzinfo=timezone.utc)
                 if (datetime.now(timezone.utc) - last_time).total_seconds() > 86400:
@@ -87,13 +81,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = Client(command_prefix='!', intents=intents)
 
-# Move all quotes from history back to quotes
+# Move all played quotes back to the active pool
 def move_quotes_back():
-    for quote in history.find():
-        quote.pop('_id', None)  # Remove the _id field
-        quote.pop('moved_to_history_at', None)  # Also remove the timestamp field
-        quotes_collection.insert_one(quote)
-    history.delete_many({})
+    return database.recycle_history()
 
 
 async def game_timeout(message_id: int, delay: int = 60):
@@ -219,12 +209,15 @@ def parse_guesses(message, members_mentioned):
 # Play command
 @client.tree.command(name="play", description="Get a random #quotes quote and guess who said it!", guild=GUILD_ID)
 async def play(interaction: discord.Interaction):
-    quote = quotes_collection.aggregate([{"$sample": {"size": 1}}]).next()
-    if history.count_documents({}) >= 100:
+    if database.played_count() >= 100:
         move_quotes_back()
-    quote["moved_to_history_at"] = datetime.now(timezone.utc)
-    history.insert_one(quote)
-    quotes_collection.delete_one({"_id": quote["_id"]})
+    quote = database.get_random_unplayed_quote()
+    if quote is None:
+        await interaction.response.send_message(
+            "No quotes available right now. Add some in #quotes and run /refresh_quotes!"
+        )
+        return
+    database.mark_played(quote["id"])
 
     quote_text = quote["redacted_quote"]
     mentioned = quote["members_mentioned"]
@@ -255,7 +248,7 @@ async def play(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 @client.tree.command(name="onboard", description="Add a new user to the members collection", guild=GUILD_ID)
 async def onboard(interaction: discord.Interaction, user: discord.Member):
-    if members_collection.find_one({"id": user.id}) is not None:
+    if database.get_member(user.id) is not None:
         await interaction.response.send_message(
             f"{user.display_name} is already in the members collection.", ephemeral=True
         )
@@ -272,7 +265,7 @@ async def onboard(interaction: discord.Interaction, user: discord.Member):
         "created_at": user.created_at.isoformat(),
         "nicks": [],
     }
-    members_collection.insert_one(member_doc)
+    database.insert_member(member_doc)
     await interaction.response.send_message(
         f"Onboarded {user.display_name}.", ephemeral=True
     )
@@ -282,7 +275,7 @@ async def onboard(interaction: discord.Interaction, user: discord.Member):
 @app_commands.checks.has_permissions(administrator=True)
 @client.tree.command(name="nicks", description="Show all nicks for a user", guild=GUILD_ID)
 async def nicks(interaction: discord.Interaction, user: discord.Member):
-    member = members_collection.find_one({"id": user.id})
+    member = database.get_member(user.id)
     if member is None:
         await interaction.response.send_message(
             f"{user.display_name} is not in the members collection.", ephemeral=True
@@ -304,7 +297,7 @@ async def nicks(interaction: discord.Interaction, user: discord.Member):
 @app_commands.checks.has_permissions(administrator=True)
 @client.tree.command(name="add", description="Add nicks to a user", guild=GUILD_ID)
 async def add(interaction: discord.Interaction, user: discord.Member, nicks: str):
-    member = members_collection.find_one({"id": user.id})
+    member = database.get_member(user.id)
     if member is None:
         await interaction.response.send_message(
             f"{user.display_name} is not in the members collection. Use /onboard first.",
@@ -319,26 +312,13 @@ async def add(interaction: discord.Interaction, user: discord.Member, nicks: str
         )
         return
 
-    members_collection.update_one(
-        {"id": user.id},
-        {"$addToSet": {"nicks": {"$each": new_nicks}}}
-    )
-
-    # Propagate new nicks to any quotes/history where this member is mentioned
-    array_filter = [{"member.id": user.id}]
-    quotes_collection.update_many(
-        {"members_mentioned.id": user.id},
-        {"$addToSet": {"members_mentioned.$[member].nicks": {"$each": new_nicks}}},
-        array_filters=array_filter,
-    )
-    history.update_many(
-        {"members_mentioned.id": user.id},
-        {"$addToSet": {"members_mentioned.$[member].nicks": {"$each": new_nicks}}},
-        array_filters=array_filter,
-    )
+    # member_nicks is the single source of truth, so quotes pick these up
+    # automatically on the next game -- no propagation needed.
+    added = database.add_nicks(user.id, new_nicks)
 
     await interaction.response.send_message(
-        f"Added nicks to {user.display_name}: {', '.join(new_nicks)}", ephemeral=True
+        f"Added nicks to {user.display_name}: {', '.join(new_nicks)} ({added} new)",
+        ephemeral=True,
     )
 
 
@@ -346,7 +326,7 @@ async def add(interaction: discord.Interaction, user: discord.Member, nicks: str
 @app_commands.checks.has_permissions(administrator=True)
 @client.tree.command(name="pref", description="Set a preferred name for a user", guild=GUILD_ID)
 async def pref(interaction: discord.Interaction, user: discord.Member, name: str):
-    member = members_collection.find_one({"id": user.id})
+    member = database.get_member(user.id)
     if member is None:
         await interaction.response.send_message(
             f"{user.display_name} is not in the members collection. Use /onboard first.",
@@ -355,10 +335,7 @@ async def pref(interaction: discord.Interaction, user: discord.Member, name: str
         return
 
     preferred = name.strip()
-    members_collection.update_one(
-        {"id": user.id},
-        {"$set": {"preferred_name": preferred}}
-    )
+    database.set_preferred_name(user.id, preferred)
     await interaction.response.send_message(
         f"Set preferred name for {user.display_name} to: {preferred}", ephemeral=True
     )
@@ -455,6 +432,6 @@ async def on_message(message: discord.Message):
 
 
 # Start the bot
-TOKEN = os.getenv('DISCORD_TOKEN')
-# webserver.keep_alive()
-client.run(TOKEN)
+if __name__ == '__main__':
+    TOKEN = os.getenv('DISCORD_TOKEN')
+    client.run(TOKEN)
