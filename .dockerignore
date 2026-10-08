@@ -1,0 +1,11 @@
+.venv
+.git
+.env
+*.db
+*.db-wal
+*.db-shm
+quotes.json
+migrate_to_sqlite.py
+__pycache__
+data
+backups
